@@ -1,0 +1,13 @@
+[package]
+name = "legacybrowse"
+version = "0.1.0"
+authors = ["Ash Wolf <ninji@wuffs.org>"]
+edition = "2018"
+
+[dependencies]
+tokio = "0.1.14"
+futures = "0.1.25"
+bytes = "0.4"
+httparse = "1.3.3"
+tokio-dns-unofficial = "0.4.0"
+nom = "^4.1"
