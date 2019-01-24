@@ -1,0 +1,18 @@
+[ req ]
+string_mask = nombstr
+default_bits           = 1024
+default_keyfile        = keyfile.pem
+distinguished_name     = req_distinguished_name
+prompt                 = no
+output_password        = mypass
+x509_extensions        = ca_extensions
+
+[ req_distinguished_name ]
+C                      = GB
+O                      = LegacyBrowse Cert
+CN                     = legacybrowse
+emailAddress           = not-a@real.email.address
+
+[ ca_extensions ]
+basicConstraints = critical,CA:true,pathlen:0
+extendedKeyUsage = serverAuth

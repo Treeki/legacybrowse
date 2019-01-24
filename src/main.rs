@@ -5,20 +5,40 @@ extern crate tokio;
 extern crate tokio_dns;
 extern crate futures;
 extern crate httparse;
+extern crate rand;
+extern crate openssl;
 
-mod records;
+pub mod records;
+use self::records::{SSLv2PackedRecord, SSLv2Record, ServerHello, CipherSpec};
 
+use std::sync::Arc;
 use tokio::io;
 use tokio::net::{TcpStream, TcpListener};
 use tokio::prelude::*;
 use futures::{Future, Async, Poll};
 use bytes::{BytesMut, BufMut};
+use rand::prelude::*;
+use openssl::pkey::{PKey, Private};
+use openssl::x509::{X509, X509Builder, X509NameBuilder};
+use openssl::x509::extension::{BasicConstraints, ExtendedKeyUsage};
+use openssl::rsa::Rsa;
+use openssl::asn1::Asn1Time;
+use openssl::bn::BigNum;
+use openssl::hash::MessageDigest;
+
+extern "C" {
+    pub fn ASN1_STRING_set_default_mask_asc(p: *const i8);
+}
 
 
 enum ConnState {
     WaitingForRequest,
     ConnectingToHost(tokio_dns::IoFuture<TcpStream>),
     ConnectProxy,
+    WriteAndShutdown
+}
+enum ConnState2 {
+    Active,
     WriteAndShutdown
 }
 
@@ -258,17 +278,9 @@ impl Future for ProxyFuture {
                     // check what the first stuff we have is
                     match self.client.read_into(&mut self.initial_buffer) {
                         ReadResult::NotReady    => return Ok(Async::NotReady),
-                        ReadResult::Err(err)    => {
-                            println!("read err: {:?}", err);
-                            self.state = ConnState::WriteAndShutdown;
-                        },
-                        ReadResult::Closed      => {
-                            println!("connection closed immediately");
-                            self.state = ConnState::WriteAndShutdown;
-                        },
-                        ReadResult::Received(_) => {
-                            self.try_handle_client_request();
-                        }
+                        ReadResult::Err(err)    => self.shutdown_err("initial read err", err),
+                        ReadResult::Closed      => self.shutdown("initial close"),
+                        ReadResult::Received(_) => self.try_handle_client_request()
                     }
                 },
                 ConnState::ConnectingToHost(future) => {
@@ -307,6 +319,7 @@ impl Future for ProxyFuture {
                         ReadResult::Closed      => self.shutdown("server closed")
                     }
 
+                    // TODO set received_stuff if written too??
                     match self.client.write() {
                         WriteResult::NotReady => not_ready = true,
                         WriteResult::Err(err) => self.shutdown_err("client write error", err),
@@ -356,14 +369,233 @@ impl Future for ProxyFuture {
 }
 
 
+struct SSLv2Config {
+    private_key: PKey<Private>,
+    certificate: X509
+}
+
+impl SSLv2Config {
+    pub fn generate_child(&self, common_name: &str) -> SSLv2Config {
+        let private_key = PKey::from_rsa(Rsa::generate(512).unwrap()).unwrap();
+
+        let mut name_builder = X509NameBuilder::new().unwrap();
+        name_builder.append_entry_by_text("CN", common_name).unwrap();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap()).unwrap();
+        builder.set_issuer_name(&self.certificate.subject_name()).unwrap();
+        builder.set_subject_name(&name_builder.build()).unwrap();
+        builder.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        builder.set_not_after(&Asn1Time::days_from_now(365).unwrap()).unwrap();
+        builder.append_extension(ExtendedKeyUsage::new().server_auth().build().unwrap()).unwrap();
+        builder.append_extension(BasicConstraints::new().build().unwrap()).unwrap();
+        builder.set_pubkey(&private_key).unwrap();
+        builder.sign(&self.private_key, MessageDigest::md5()).unwrap();
+
+        return SSLv2Config {
+            private_key,
+            certificate: builder.build()
+        };
+    }
+}
+
+
+#[derive(Debug, PartialEq)]
+enum SSLState {
+    WaitingForHello,
+    SentServerHello,
+}
+
+
+struct TestFuture {
+    state: ConnState2,
+    client: Socket,
+    initial_buffer: BytesMut,
+    ssl_state: SSLState,
+    connection_id: [u8; 16],
+    ssl_config: Arc<SSLv2Config>
+}
+
+impl TestFuture {
+    fn new(socket: TcpStream, ssl_config: Arc<SSLv2Config>) -> TestFuture {
+        TestFuture {
+            state: ConnState2::Active,
+            client: Socket::new(Some(socket)),
+            initial_buffer: BytesMut::new(),
+            ssl_state: SSLState::WaitingForHello,
+            connection_id: [0u8; 16],
+            ssl_config
+        }
+    }
+
+    fn shutdown(&mut self, description: &str) {
+        println!("closing due to {}", description);
+        self.state = ConnState2::WriteAndShutdown;
+    }
+
+    fn shutdown_err(&mut self, description: &str, err: io::Error) {
+        println!("closing due to {}: {}", description, err);
+        self.state = ConnState2::WriteAndShutdown;
+    }
+
+    fn handle_stuff(&mut self) {
+        let buffer = self.initial_buffer.take();
+        let packed_result = records::parse_sslv2_packed_record(&buffer);
+        match packed_result {
+            Ok((remainder, packed_record)) => {
+                println!("parsed record: {:?}", packed_record);
+
+                let result = records::parse_sslv2_record(packed_record.data);
+                match result {
+                    Ok((remainder, record)) => {
+                        println!("remainder: {:?}", remainder);
+                        println!("record: {:?}", record);
+                        self.handle_sslv2_record(record);
+                    },
+                    Err(e) => {
+                        println!("record parse error: {}", e);
+                        self.shutdown("parse error");
+                    }
+                }
+
+                drop(packed_record);
+                // return the buffer, less the parsed record
+                let parsed_length = buffer.len() - remainder.len();
+                self.initial_buffer = buffer;
+                self.initial_buffer.advance(parsed_length);
+            },
+            Err(nom::Err::Incomplete(_)) => {
+                // more data needed
+                self.initial_buffer = buffer;
+            },
+            Err(e) => {
+                println!("packed record parse error: {}", e);
+                self.shutdown("parse error");
+            }
+        }
+    }
+
+    fn handle_sslv2_record(&mut self, record: SSLv2Record) {
+        match record {
+            SSLv2Record::ClientHello(r) => {
+                if self.ssl_state != SSLState::WaitingForHello {
+                    self.shutdown("received unexpected clienthello");
+                    return;
+                }
+                thread_rng().fill_bytes(&mut self.connection_id);
+
+                let own_config = self.ssl_config.generate_child("192.168.1.83");
+                let certificate = own_config.certificate.to_der().unwrap();
+                let connection_id = self.connection_id;
+
+                let reply = ServerHello {
+                    session_id_hit: false,
+                    has_certificate: false,
+                    version: 2,
+                    certificate: &certificate,
+                    cipher_specs: vec![CipherSpec::RC4128Export40WithMD5],
+                    connection_id: &connection_id
+                };
+                self.send_sslv2_record(SSLv2Record::ServerHello(reply));
+                self.ssl_state = SSLState::SentServerHello;
+            },
+            _ => {
+                println!("not handled");
+            }
+        }
+    }
+
+    fn send_sslv2_record(&mut self, record: SSLv2Record) {
+        println!("sending: {:?}", record);
+
+        let mut inner_buffer = BytesMut::new();
+        inner_buffer.reserve(16384);
+        record.write(&mut inner_buffer);
+
+        let packed_record = SSLv2PackedRecord { data: &inner_buffer, padding: 0 };
+        self.client.write_buf.reserve(inner_buffer.len() + 3);
+        packed_record.write(&mut self.client.write_buf);
+    }
+}
+
+impl Future for TestFuture {
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<(), io::Error> {
+        loop {
+            match &mut self.state {
+                ConnState2::Active => {
+                    // check what the first stuff we have is
+                    let mut not_ready = false;
+                    let mut done_stuff = false; // in case we need to loop over again
+
+                    match self.client.read_into(&mut self.initial_buffer) {
+                        ReadResult::NotReady    => return Ok(Async::NotReady),
+                        ReadResult::Err(err)    => self.shutdown_err("initial read err", err),
+                        ReadResult::Closed      => self.shutdown("initial close"),
+                        ReadResult::Received(n) => {
+                            done_stuff = true;
+                            self.handle_stuff();
+                            println!("got {}", n);
+                        }
+                    }
+
+                    match self.client.write() {
+                        WriteResult::NotReady => not_ready = true,
+                        WriteResult::Err(err) => self.shutdown_err("client write error", err),
+                        WriteResult::Sent(n)  => {
+                            done_stuff = true;
+                            println!("sent {}", n);
+                        },
+                        WriteResult::Closed   => ()
+                    }
+
+                    if not_ready && !done_stuff {
+                        return Ok(Async::NotReady);
+                    }
+                },
+                ConnState2::WriteAndShutdown => {
+                    match self.client.write_and_shutdown() {
+                        WriteResult::NotReady => return Ok(Async::NotReady),
+                        WriteResult::Closed   => return Ok(Async::Ready(())),
+                        WriteResult::Err(err) => println!("client shutdown error: {}", err),
+                        _                     => ()
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 fn main() {
-    let addr = "127.0.0.1:8889".parse().unwrap();
+    unsafe {
+        let s = std::ffi::CString::new("nombstr").unwrap();
+        ASN1_STRING_set_default_mask_asc(s.as_ptr());
+    }
+
+    let addr = "0.0.0.0:8889".parse().unwrap();
     let listener = TcpListener::bind(&addr).unwrap();
 
-    let server = listener.incoming().for_each(|socket| {
+    let privkey_data = std::fs::read("root.key").unwrap();
+    let cert_data = std::fs::read("root.pem").unwrap();
+
+    let root_ssl_config = Arc::new(SSLv2Config {
+        private_key: PKey::private_key_from_pem(&privkey_data).unwrap(),
+        certificate: X509::from_pem(&cert_data).unwrap()
+    });
+
+    // let child_config = root_ssl_config.generate_child("bork");
+    // let crt = child_config.certificate.to_pem().unwrap();
+    // std::fs::write("test.pem", crt);
+
+    // return;
+
+    let server = listener.incoming().for_each(move |socket| {
         println!("got socket");
-        let handler = ProxyFuture::new(socket)
+        let handler = TestFuture::new(socket, root_ssl_config.clone())
         .map_err(|err| {
             println!("handler error: {}", err);
         });
