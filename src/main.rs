@@ -23,7 +23,7 @@ use openssl::x509::{X509, X509Builder, X509NameBuilder};
 use openssl::x509::extension::{BasicConstraints, ExtendedKeyUsage};
 use openssl::rsa::Rsa;
 use openssl::asn1::Asn1Time;
-use openssl::bn::BigNum;
+use openssl::bn::{BigNum, MsbOption};
 use openssl::hash::MessageDigest;
 
 extern "C" {
@@ -379,17 +379,23 @@ impl SSLv2Config {
         let private_key = PKey::from_rsa(Rsa::generate(512).unwrap()).unwrap();
 
         let mut name_builder = X509NameBuilder::new().unwrap();
+        name_builder.append_entry_by_text("C", "GB").unwrap();
+        name_builder.append_entry_by_text("O", "AutoCert").unwrap();
         name_builder.append_entry_by_text("CN", common_name).unwrap();
+        name_builder.append_entry_by_text("emailAddress", "not-a@real.email.address").unwrap();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(256, MsbOption::MAYBE_ZERO, true).unwrap();
 
         let mut builder = X509Builder::new().unwrap();
         builder.set_version(2).unwrap();
-        builder.set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap()).unwrap();
+        builder.set_serial_number(&serial.to_asn1_integer().unwrap()).unwrap();
         builder.set_issuer_name(&self.certificate.subject_name()).unwrap();
         builder.set_subject_name(&name_builder.build()).unwrap();
         builder.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
         builder.set_not_after(&Asn1Time::days_from_now(365).unwrap()).unwrap();
-        builder.append_extension(ExtendedKeyUsage::new().server_auth().build().unwrap()).unwrap();
         builder.append_extension(BasicConstraints::new().build().unwrap()).unwrap();
+        builder.append_extension(ExtendedKeyUsage::new().server_auth().build().unwrap()).unwrap();
         builder.set_pubkey(&private_key).unwrap();
         builder.sign(&self.private_key, MessageDigest::md5()).unwrap();
 
@@ -485,13 +491,12 @@ impl TestFuture {
                 }
                 thread_rng().fill_bytes(&mut self.connection_id);
 
-                let own_config = self.ssl_config.generate_child("192.168.1.83");
+                let own_config = self.ssl_config.generate_child("*");
                 let certificate = own_config.certificate.to_der().unwrap();
                 let connection_id = self.connection_id;
 
                 let reply = ServerHello {
                     session_id_hit: false,
-                    has_certificate: false,
                     version: 2,
                     certificate: &certificate,
                     cipher_specs: vec![CipherSpec::RC4128Export40WithMD5],
@@ -587,11 +592,9 @@ fn main() {
         certificate: X509::from_pem(&cert_data).unwrap()
     });
 
-    // let child_config = root_ssl_config.generate_child("bork");
-    // let crt = child_config.certificate.to_pem().unwrap();
-    // std::fs::write("test.pem", crt);
-
-    // return;
+    let child_config = root_ssl_config.generate_child("test");
+    let crt = child_config.certificate.to_pem().unwrap();
+    std::fs::write("test.pem", crt);
 
     let server = listener.incoming().for_each(move |socket| {
         println!("got socket");

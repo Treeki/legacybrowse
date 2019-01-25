@@ -198,7 +198,6 @@ named!(parse_client_certificate<ClientCertificate>,
 #[derive(Debug)]
 pub struct ServerHello<'a> {
     pub session_id_hit: bool,
-    pub has_certificate: bool, // always 0 or SSL_X509_CERTIFICATE
     pub version: u16,
     pub certificate: &'a [u8],
     pub cipher_specs: Vec<CipherSpec>,
@@ -207,8 +206,8 @@ pub struct ServerHello<'a> {
 
 impl <'a> ServerHello<'a> {
     fn write(&self, to: &mut BufMut) {
-        to.put_u8(if self.session_id_hit { 1 } else { 0 });
-        to.put_u8(if self.has_certificate { 1 } else { 0 });
+        to.put_u8(if self.session_id_hit { 1 } else { 0 }); // session_id
+        to.put_u8(if self.session_id_hit { 0 } else { 1 }); // zero or SSL_X509_CERTIFICATE
         to.put_u16_be(self.version);
         to.put_u16_be(self.certificate.len() as u16);
         to.put_u16_be((self.cipher_specs.len() * 3) as u16);
@@ -225,6 +224,7 @@ impl <'a> ServerHello<'a> {
 named!(parse_server_hello<ServerHello>,
     do_parse!(
         session_id_hit: map!(be_u8, |v| v != 0) >>
+        verify!(be_u8, |v| (!session_id_hit && v == 1) || (session_id_hit && v == 0)) >>
         has_certificate: map!(verify!(be_u8, |v| v == 0 || v == 1), |v| v == 1) >>
         version: be_u16 >>
         certificate_length: be_u16 >>
@@ -233,7 +233,7 @@ named!(parse_server_hello<ServerHello>,
         certificate: take!(certificate_length) >>
         cipher_specs: length_count!(value!(cipher_specs_length / 3), parse_cipher_spec) >>
         connection_id: take!(connection_id_length) >>
-        (ServerHello { session_id_hit, has_certificate, version, certificate, cipher_specs, connection_id })
+        (ServerHello { session_id_hit, version, certificate, cipher_specs, connection_id })
     )
 );
 
