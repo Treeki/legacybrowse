@@ -41,7 +41,7 @@ named!(pub parse_sslv2_packed_record<SSLv2PackedRecord>,
     )
 );
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum CipherSpec {
     RC4128WithMD5,            // 0x010080
     RC4128Export40WithMD5,    // 0x020080
@@ -225,7 +225,6 @@ named!(parse_server_hello<ServerHello>,
     do_parse!(
         session_id_hit: map!(be_u8, |v| v != 0) >>
         verify!(be_u8, |v| (!session_id_hit && v == 1) || (session_id_hit && v == 0)) >>
-        has_certificate: map!(verify!(be_u8, |v| v == 0 || v == 1), |v| v == 1) >>
         version: be_u16 >>
         certificate_length: be_u16 >>
         cipher_specs_length: be_u16 >>
