@@ -11,6 +11,7 @@ extern crate openssl;
 pub mod records;
 use self::records::{SSLv2PackedRecord, SSLv2Record, ServerHello, CipherSpec};
 
+use io::{Error, ErrorKind};
 use std::sync::Arc;
 use tokio::io;
 use tokio::net::{TcpStream, TcpListener};
@@ -811,6 +812,281 @@ impl Future for TestFuture {
                         _                     => ()
                     }
                 }
+            }
+        }
+    }
+}
+
+
+
+struct SSLv2Stream {
+    connection_id: [u8; 16],
+    config: Arc<SSLv2Config>,
+    read_buf: BytesMut,
+    write_buf: BytesMut,
+    stream: TcpStream,
+    cipher_data: SSLCipherData
+}
+
+
+
+
+
+enum SSLv2HandshakeState {
+    WaitingForHello,
+    WaitingForMasterKey(Vec<u8>, PKey<Private>),
+    WaitingForClientFinish(SSLCipherData),
+    Invalid
+}
+
+struct SSLv2Handshake {
+    state: SSLv2HandshakeState,
+    connection_id: [u8; 16],
+    config: Arc<SSLv2Config>,
+    read_buf: BytesMut,
+    write_buf: BytesMut,
+    stream: Option<TcpStream>
+}
+
+impl SSLv2Handshake {
+    fn new(stream: TcpStream, config: Arc<SSLv2Config>) -> SSLv2Handshake {
+        let mut connection_id = [0u8; 16];
+        thread_rng().fill_bytes(&mut connection_id);
+
+        SSLv2Handshake {
+            state: SSLv2HandshakeState::WaitingForHello,
+            connection_id,
+            config,
+            read_buf: BytesMut::new(),
+            write_buf: BytesMut::new(),
+            stream: Some(stream)
+        }
+    }
+
+    fn handle_record(&mut self, record: SSLv2Record) -> io::Result<bool> {
+        use self::SSLv2HandshakeState::*;
+
+        match self.state {
+            WaitingForHello => {
+                if let SSLv2Record::ClientHello(r) = record {
+                    if r.version != 2 && r.version != 0x300 {
+                        return Err(Error::new(ErrorKind::InvalidData, "wrong client version"));
+                    }
+
+                    let own_config = self.config.generate_child("*");
+                    let certificate = own_config.certificate.to_der().unwrap();
+                    let connection_id = self.connection_id;
+
+                    let reply = ServerHello {
+                        session_id_hit: false,
+                        version: 2,
+                        certificate: &certificate,
+                        cipher_specs: vec![CipherSpec::RC4128Export40WithMD5],
+                        connection_id: &connection_id
+                    };
+                    self.send_record(SSLv2Record::ServerHello(reply));
+
+                    let challenge = Vec::from(r.challenge);
+                    self.state = WaitingForMasterKey(challenge, own_config.private_key);
+                    return Ok(false);
+                }
+            },
+            WaitingForMasterKey(ref challenge, ref private_key) => {
+                if let SSLv2Record::ClientMasterKey(r) = record {
+                    if r.cipher_kind != CipherSpec::RC4128Export40WithMD5 {
+                        return Err(Error::new(ErrorKind::InvalidData, "unexpected cipher kind"));
+                    }
+
+                    // key arg should be empty
+                    if !r.key_arg.is_empty() {
+                        return Err(Error::new(ErrorKind::InvalidData, "key arg not empty"));
+                    }
+
+                    // for RC4_128_EXPORT40_WITH_MD5,
+                    // 5 bytes are encrypted, 11 are clear
+                    if r.clear_key.len() != 11 {
+                        return Err(Error::new(ErrorKind::InvalidData, "unexpected clear_key length"));
+                    }
+
+                    // encrypted key holds the secret portion of the key, formatted
+                    // using PKCS#1 block type 2 and encrypted using our pubkey
+                    let mut decrypted = vec![0u8; r.encrypted_key.len()];
+                    let rsa = private_key.rsa().unwrap();
+                    let size = rsa.private_decrypt(r.encrypted_key, &mut decrypted, Padding::PKCS1).unwrap();
+                    if size != 5 {
+                        return Err(Error::new(ErrorKind::InvalidData, "unexpected encrypted_key length"));
+                    }
+
+                    // build master key
+                    let mut master_key = [0u8; 16];
+                    master_key[0..11].copy_from_slice(r.clear_key);
+                    master_key[11..16].copy_from_slice(&decrypted[..size]);
+
+                    // build key material using MD5
+                    let mut key_material_src: Vec<u8> = Vec::new();
+                    key_material_src.extend(&master_key);
+                    key_material_src.push(b'0');
+                    key_material_src.extend(challenge);
+                    key_material_src.extend(&self.connection_id);
+
+                    let key_material_0 = openssl::hash::hash(MessageDigest::md5(), &key_material_src).unwrap();
+
+                    key_material_src[master_key.len()] = b'1';
+                    let key_material_1 = openssl::hash::hash(MessageDigest::md5(), &key_material_src).unwrap();
+
+                    // we now have keys
+                    let read_key: &[u8] = &key_material_1;
+                    let write_key: &[u8] = &key_material_0;
+                    let read_sequence = 2; // we've received 2 records so far
+                    let write_sequence = 1; // we've sent 1 record so far
+                    let cipher_data = SSLCipherData::new(read_key, write_key, read_sequence, write_sequence);
+
+                    let challenge = challenge.clone();
+                    let reply = SSLv2Record::ServerVerify(&challenge);
+
+                    self.state = WaitingForClientFinish(cipher_data);
+                    self.send_record(reply);
+                    return Ok(false);
+                }
+            },
+            WaitingForClientFinish(ref cipher_data) => {
+                if let SSLv2Record::ClientFinished(id) = record {
+                    if id == &self.connection_id {
+                        // all is OK!
+                        let reply = SSLv2Record::ServerFinished(&[0u8; 16]);
+                        self.send_record(reply);
+                        return Ok(true);
+                    }
+                }
+            },
+            Invalid => panic!()
+        }
+        return Err(Error::new(ErrorKind::InvalidData, "unexpected handshake record"));
+    }
+
+    fn send_record(&mut self, record: SSLv2Record) {
+        let mut inner_buffer = BytesMut::new();
+        inner_buffer.reserve(16384);
+        record.write(&mut inner_buffer);
+
+        match self.state {
+            SSLv2HandshakeState::WaitingForClientFinish(ref mut cipher_data) => {
+                let (result, padding) = cipher_data.encrypt_and_hash(&inner_buffer);
+                let packed_record = SSLv2PackedRecord { data: &result, padding };
+
+                self.write_buf.reserve(packed_record.data.len() + 3);
+                packed_record.write(&mut self.write_buf);
+            },
+            _ => {
+                let packed_record = SSLv2PackedRecord { data: &inner_buffer, padding: 0 };
+
+                self.write_buf.reserve(packed_record.data.len() + 3);
+                packed_record.write(&mut self.write_buf);
+            }
+        };
+
+    }
+
+    fn into_stream(&mut self) -> SSLv2Stream {
+        let state_swap = std::mem::replace(&mut self.state, SSLv2HandshakeState::Invalid);
+
+        if let SSLv2HandshakeState::WaitingForClientFinish(cipher_data) = state_swap {
+            SSLv2Stream {
+                connection_id: self.connection_id,
+                config: self.config.clone(),
+                read_buf: self.read_buf.take(),
+                write_buf: self.write_buf.take(),
+                stream: self.stream.take().unwrap(),
+                cipher_data
+            }
+        } else {
+            panic!()
+        }
+    }
+}
+
+impl Future for SSLv2Handshake {
+    type Item = SSLv2Stream;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<SSLv2Stream, io::Error> {
+        loop {
+            let mut not_ready = false;
+            let mut done_stuff = false;
+
+            // parse incoming data
+            self.read_buf.reserve(1024);
+            match self.stream.as_mut().unwrap().poll_read(&mut self.read_buf) {
+                Ok(Async::Ready(0)) => return Err(Error::new(ErrorKind::ConnectionReset, "connection closed during handshake")),
+                Ok(Async::Ready(n)) => done_stuff = true,
+                Ok(Async::NotReady) => not_ready = true,
+                Err(e)              => return Err(e)
+            }
+
+
+            // can we parse anything?
+            if !self.read_buf.is_empty() {
+                let buffer = self.read_buf.take();
+
+                match records::parse_sslv2_packed_record(&buffer) {
+                    Ok((remainder, rec)) => {
+                        // this may need decrypting
+                        let unpacked_data = match &mut self.state {
+                            SSLv2HandshakeState::WaitingForClientFinish(cipher_data) => {
+                                match cipher_data.decrypt_and_verify(rec.data, rec.padding) {
+                                    Some(buffer) => buffer,
+                                    None => return Err(Error::new(ErrorKind::InvalidData, "bad MAC"))
+                                }
+                            },
+                            _ => Vec::from(rec.data)
+                        };
+
+                        // return the buffer, less the parsed record
+                        let parsed_length = buffer.len() - remainder.len();
+                        self.read_buf = buffer;
+                        self.read_buf.advance(parsed_length);
+
+                        // parse the decrypted record
+                        let handshake_completed = match records::parse_sslv2_record(&unpacked_data) {
+                            Ok((_, record)) => self.handle_record(record)?,
+                            Err(e) => return Err(Error::new(ErrorKind::InvalidData, "bad record"))
+                        };
+                        if handshake_completed {
+                            return Ok(Async::Ready(self.into_stream()));
+                        }
+
+                        if !self.read_buf.is_empty() {
+                            // just in case: loop back around and parse the next record
+                            done_stuff = true;
+                        }
+                    },
+                    Err(nom::Err::Incomplete(_)) => {
+                        // more data needed
+                        self.read_buf = buffer;
+                    },
+                    Err(_) => {
+                        // fatal error
+                        return Err(Error::new(ErrorKind::InvalidData, "invalid record"));
+                    }
+                }
+            }
+
+
+            // shovel outgoing data
+            if !self.write_buf.is_empty() {
+                match self.stream.as_mut().unwrap().poll_write(&self.write_buf) {
+                    Ok(Async::Ready(n)) => {
+                        self.write_buf.advance(n);
+                        done_stuff = true;
+                    },
+                    Ok(Async::NotReady) => not_ready = true,
+                    Err(e)              => return Err(e)
+                }
+            }
+
+
+            if not_ready && !done_stuff {
+                return Ok(Async::NotReady);
             }
         }
     }
