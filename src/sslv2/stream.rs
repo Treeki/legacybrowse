@@ -7,7 +7,7 @@ use std::io::{Read, Write, Error, ErrorKind};
 use std::mem;
 use std::net::TcpStream;
 use std::sync::Arc;
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use rand::prelude::*;
 use openssl::pkey::{PKey, Private};
 use openssl::rsa::Padding;
@@ -15,8 +15,6 @@ use openssl::hash::MessageDigest;
 
 
 pub struct Stream {
-    connection_id: [u8; 16],
-    config: Arc<Config>,
     read_buf: BytesMut,
     read_buf_decrypted: BytesMut,
     write_buf: BytesMut,
@@ -259,8 +257,6 @@ impl Handshake {
     fn into_stream(&mut self) -> Stream {
         match mem::replace(&mut self.state, HandshakeState::Invalid) {
 			HandshakeState::WaitingForFlush(cipher_data) => Stream {
-                connection_id: self.connection_id,
-                config: self.config.clone(),
                 read_buf: self.read_buf.take(),
                 write_buf: self.write_buf.take(),
 				read_buf_decrypted: BytesMut::new(),
@@ -364,10 +360,10 @@ pub fn test() {
 
 	let mut buf = BytesMut::new();
 	buf.reserve(2048);
-	buf.read_from(&mut stream);
+	buf.read_from(&mut stream).unwrap();
 	println!("read: {:?}", buf);
 
-	stream.write_all(b"HTTP/1.0 200 Found\r\nContent-Type: text/html\r\n\r\n<html><body>test</body></html>");
-	stream.flush();
+	stream.write_all(b"HTTP/1.0 200 Found\r\nContent-Type: text/html\r\n\r\n<html><body>test</body></html>").unwrap();
+	stream.flush().unwrap();
 }
 
