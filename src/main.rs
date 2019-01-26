@@ -9,9 +9,12 @@ extern crate rand;
 extern crate openssl;
 
 pub mod records;
+pub mod stream;
+pub mod util;
+
 use self::records::{SSLv2PackedRecord, SSLv2Record, ServerHello, CipherSpec};
 
-use io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use tokio::io;
 use tokio::net::{TcpStream, TcpListener};
@@ -1098,6 +1101,9 @@ fn main() {
         let s = std::ffi::CString::new("nombstr").unwrap();
         ASN1_STRING_set_default_mask_asc(s.as_ptr());
     }
+
+    stream::test();
+    return;
 
     let addr = "0.0.0.0:8889".parse().unwrap();
     let listener = TcpListener::bind(&addr).unwrap();
