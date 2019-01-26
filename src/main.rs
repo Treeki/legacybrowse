@@ -8,11 +8,9 @@ extern crate httparse;
 extern crate rand;
 extern crate openssl;
 
-pub mod records;
-pub mod stream;
-pub mod util;
+pub mod sslv2;
 
-use self::records::{SSLv2PackedRecord, SSLv2Record, ServerHello, CipherSpec};
+use self::sslv2::records::{SSLv2PackedRecord, SSLv2Record, ServerHello, CipherSpec};
 
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
@@ -569,7 +567,7 @@ impl TestFuture {
 
     fn handle_stuff(&mut self) {
         let buffer = self.initial_buffer.take();
-        let packed_result = records::parse_sslv2_packed_record(&buffer);
+        let packed_result = sslv2::records::parse_sslv2_packed_record(&buffer);
         match packed_result {
             Ok((remainder, packed_record)) => {
                 println!("parsed record: {:?}", packed_record);
@@ -596,7 +594,7 @@ impl TestFuture {
                     println!("we've got Data...");
                     println!("{:?}", packed_record.data);
                 } else {
-                    let result = records::parse_sslv2_record(&unpacked_data);
+                    let result = sslv2::records::parse_sslv2_record(&unpacked_data);
                     match result {
                         Ok((remainder, record)) => {
                             println!("remainder: {:?}", remainder);
@@ -1031,7 +1029,7 @@ impl Future for SSLv2Handshake {
             if !self.read_buf.is_empty() {
                 let buffer = self.read_buf.take();
 
-                match records::parse_sslv2_packed_record(&buffer) {
+                match sslv2::records::parse_sslv2_packed_record(&buffer) {
                     Ok((remainder, rec)) => {
                         // this may need decrypting
                         let unpacked_data = match &mut self.state {
@@ -1050,7 +1048,7 @@ impl Future for SSLv2Handshake {
                         self.read_buf.advance(parsed_length);
 
                         // parse the decrypted record
-                        let handshake_completed = match records::parse_sslv2_record(&unpacked_data) {
+                        let handshake_completed = match sslv2::records::parse_sslv2_record(&unpacked_data) {
                             Ok((_, record)) => self.handle_record(record)?,
                             Err(e) => return Err(Error::new(ErrorKind::InvalidData, "bad record"))
                         };
@@ -1102,7 +1100,7 @@ fn main() {
         ASN1_STRING_set_default_mask_asc(s.as_ptr());
     }
 
-    stream::test();
+    sslv2::stream::test();
     return;
 
     let addr = "0.0.0.0:8889".parse().unwrap();

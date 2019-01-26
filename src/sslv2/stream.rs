@@ -1,6 +1,6 @@
-use crate::records;
-use crate::records::{SSLv2PackedRecord, SSLv2Record, ServerHello, CipherSpec};
-use crate::util::{CipherData, Config, ReadIntoBytesMut};
+use super::records;
+use super::records::{SSLv2PackedRecord, SSLv2Record, ServerHello, CipherSpec};
+use super::util::{CipherData, Config, ReadIntoBytesMut};
 use std::cmp;
 use std::io;
 use std::io::{Read, Write, Error, ErrorKind};
@@ -28,13 +28,11 @@ pub struct Stream {
 impl Read for Stream {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		assert!(!buf.is_empty());
-		println!("reading into buf size {}", buf.len());
 
 		loop {
 			// first, return stuff from our own decrypted buffer
 			if !self.read_buf_decrypted.is_empty() {
 				let read_amount = cmp::min(buf.len(), self.read_buf_decrypted.len());
-				println!("gonna give you {}", read_amount);
 				let read_chunk = self.read_buf_decrypted.split_to(read_amount);
 				buf[..read_amount].copy_from_slice(&read_chunk);
 				return Ok(read_amount);
@@ -42,13 +40,10 @@ impl Read for Stream {
 
 			// next, check our own encrypted buffer
 			while !self.read_buf.is_empty() {
-				println!("gonna try a record");
 				match records::parse_sslv2_packed_record(&self.read_buf) {
 					Ok((remainder, rec)) => {
-						println!("got a thing");
 						let data = self.cipher_data.decrypt_and_verify(rec.data, rec.padding)?;
 						self.read_buf_decrypted.extend_from_slice(&data);
-						println!("added data {:?}", data);
 
 						let parsed_amount = self.read_buf.len() - remainder.len();
 						self.read_buf.advance(parsed_amount);
@@ -60,7 +55,6 @@ impl Read for Stream {
 
 			// once we've emptied both our buffers, go to the socket
 			if self.read_buf_decrypted.is_empty() {
-				println!("gonna read from stream");
 				self.read_buf.reserve(0x8000 + 3);
 				if self.read_buf.read_from(&mut self.stream)? == 0 {
 					return Ok(0); // eof
@@ -134,8 +128,6 @@ impl Handshake {
 
     fn handle_record(&mut self, record: SSLv2Record) -> io::Result<()> {
         use self::HandshakeState::*;
-
-		println!("received: {:?}", record);
 
         match self.state {
             WaitingForHello => {
@@ -327,7 +319,6 @@ impl Handshake {
 	pub fn handshake(&mut self) -> io::Result<Stream> {
         loop {
 			self.write_pending_data()?;
-
 			let stream = self.stream.as_mut().unwrap();
 
 			match self.state {
@@ -345,35 +336,6 @@ impl Handshake {
 					}
 				}
 			}
-
-            // // parse incoming data
-            // let handshake_complete = match self.read_buf.read_from(stream) {
-			// 	Err(e) => {
-			// 		if e.kind() == ErrorKind::WouldBlock {
-			// 			would_block = true;
-			// 			false
-			// 		} else {
-			// 			return Err(e);
-			// 		}
-			// 	},
-			// 	Ok(0) => return Err(Error::from(ErrorKind::ConnectionReset)),
-			// 	Ok(_) => self.process_read_buffer()?
-			// };
-
-            // // shovel outgoing data
-            // if !self.write_buf.is_empty() {
-			// 	match stream.write(&self.write_buf) {
-			// 		Err(e) => {
-			// 			if e.kind() == ErrorKind::WouldBlock {
-			// 				would_block = true;
-			// 			} else {
-			// 				return Err(e);
-			// 			}
-			// 		},
-			// 		Ok(0) => return Err(Error::from(ErrorKind::Other)),
-			// 		Ok(n) => self.write_buf.advance(n)
-			// 	}
-            // }
         }
     }
 }
