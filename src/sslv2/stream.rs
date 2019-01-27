@@ -33,6 +33,7 @@ impl <S: Write> Stream<S> {
 			let written = self.stream.write(&self.write_buf_encrypted)?;
             println!("written ciphertext {}", written);
 			self.write_buf_encrypted.advance(written);
+            println!("{} remain", self.write_buf_encrypted.len());
 		}
         Ok(())
     }
@@ -51,6 +52,7 @@ impl <S: Write + AsyncWrite> Stream<S> {
 impl <S: AsyncRead + AsyncWrite> AsyncRead for Stream<S> { }
 impl <S: AsyncRead + AsyncWrite> AsyncWrite for Stream<S> {
     fn shutdown(&mut self) -> tokio::io::Result<Async<()>> {
+        println!("enter shutdown");
         try_ready!(self.poll_flush());
         return self.stream.shutdown();
     }
@@ -71,6 +73,7 @@ impl <S: Read + Write> Read for Stream<S> {
 
 			// next, check our own encrypted buffer
 			while !self.read_buf.is_empty() {
+                println!("we've got {} in read_buf", self.read_buf.len());
 				match records::parse_sslv2_packed_record(&self.read_buf) {
 					Ok((remainder, rec)) => {
 						let data = self.cipher_data.decrypt_and_verify(rec.data, rec.padding)?;
@@ -87,7 +90,9 @@ impl <S: Read + Write> Read for Stream<S> {
 			// once we've emptied both our buffers, go to the socket
 			if self.read_buf_decrypted.is_empty() {
 				self.read_buf.reserve(0x8000 + 3);
-				if self.read_buf.read_from(&mut self.stream)? == 0 {
+                let n = self.read_buf.read_from(&mut self.stream)?;
+                println!("STREAM READ: {}", n);
+				if n == 0 {
 					return Ok(0); // eof
 				}
 			}
@@ -99,8 +104,10 @@ impl <S: Read + Write> Write for Stream<S> {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // encrypt this data in chunks
         // 0x3000 is a reasonable baseline, I think
-        for chunk in buf.chunks(0x3000) {
+        for chunk in buf.chunks(1024) {
             println!("encrypting chunk");
+            let chunk_str = String::from_utf8_lossy(chunk);
+            println!("<{}>", chunk_str);
             let (record_enc, padding) = self.cipher_data.encrypt_and_hash(chunk);
             self.write_buf_encrypted.reserve(record_enc.len() + 3);
 			let record = SSLv2PackedRecord { data: &record_enc, padding };
@@ -110,6 +117,7 @@ impl <S: Read + Write> Write for Stream<S> {
 	}
 
 	fn flush(&mut self) -> io::Result<()> {
+        println!("flushing... <{}>", self.write_buf_encrypted.len());
         self.write_pending_ciphertext()?;
 		self.stream.flush()?;
 		Ok(())
@@ -330,7 +338,10 @@ impl <S: Read + Write> Handshake<S> {
 			let stream = self.stream.as_mut().unwrap();
 			match stream.write(&self.write_buf)? {
 				0 => return Err(Error::from(ErrorKind::WriteZero)),
-				n => self.write_buf.advance(n)
+				n => {
+                    println!("HANDSHAKE WRITE: {}", n);
+                    self.write_buf.advance(n);
+                }
 			}
 		}
 		Ok(())
@@ -352,7 +363,10 @@ impl <S: Read + Write> Handshake<S> {
 					self.read_buf.reserve(0x8000 + 3);
 					match self.read_buf.read_from(stream)? {
 						0 => return Err(Error::from(ErrorKind::ConnectionReset)),
-						_ => self.process_read_buffer()?
+						n => {
+                            println!("HANDSHAKE READ: {}", n);
+                            self.process_read_buffer()?;
+                        }
 					}
 				}
 			}

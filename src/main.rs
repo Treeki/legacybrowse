@@ -81,7 +81,7 @@ impl Future for TunnelFuture {
             match self {
                 Handshake(hs, _) => {
                     let client = try_ready!(hs.poll());
-                    println!("handshake complete");
+                    println!("handshake complete, gonna replace");
 
                     match mem::replace(self, Invalid) {
                         Handshake(_, server) => {
@@ -93,6 +93,8 @@ impl Future for TunnelFuture {
                         },
                         _ => panic!()
                     }
+
+                    println!("replaced");
                 },
                 DataExchange { ref mut client, ref mut client_write_buf, ref mut server, ref mut server_write_buf } => {
                     // do some exchanging
@@ -122,11 +124,15 @@ impl Future for TunnelFuture {
 
                     let client_wp = client.poll_write_pending_ciphertext();
 
+                    match (&client_rd, &server_rd, &client_wr, &server_wr, &client_wp) {
+                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::Ready(0)), Ok(Async::Ready(0)), Ok(_)) => (),
+                        _ => println!("rd: {:?} {:?} wr: {:?} {:?} wp: {:?}", client_rd, server_rd, client_wr, server_wr, client_wp)
+                    }
                     match (client_rd, server_rd, client_wr, server_wr, client_wp) {
-                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady)) |
-                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::Ready(0)), Ok(Async::NotReady), Ok(Async::NotReady)) |
-                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::Ready(0)), Ok(Async::NotReady)) |
-                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::Ready(0)), Ok(Async::Ready(0)), Ok(Async::NotReady)) => {
+                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady), Ok(_)) |
+                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::Ready(0)), Ok(Async::NotReady), Ok(_)) |
+                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::Ready(0)), Ok(_)) |
+                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::Ready(0)), Ok(Async::Ready(0)), Ok(_)) => {
                             // nothing has been read or written
                             return Ok(Async::NotReady);
                         },

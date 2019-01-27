@@ -151,7 +151,7 @@ impl CipherData {
         // generate and include MAC
         println!("[ Doing a MAC ]");
         println!("write key data: {:?}", Vec::from(&self.write_key_data[..]));
-        println!("dec record: {:?}", Vec::from(&dec_record[mac_size..]));
+        // println!("dec record: {:?}", Vec::from(&dec_record[mac_size..]));
         println!("write sequence: {:?}", Vec::from(&self.write_sequence.to_be_bytes()[..]));
         let mut hasher = Hasher::new(MessageDigest::md5()).unwrap();
         hasher.update(&self.write_key_data).unwrap();
@@ -164,10 +164,10 @@ impl CipherData {
         // encrypt the whole thing
         // openssl requires block_size extra bytes
         let mut enc_record = vec![0u8; dec_record.len() + block_size];
-        println!("full dec record: {:?}", dec_record);
+        // println!("full dec record: {:?}", dec_record);
         self.write_crypter.update(&dec_record, &mut enc_record).unwrap();
         enc_record.truncate(dec_record.len());
-        println!("full enc record: {:?}", enc_record);
+        // println!("full enc record: {:?}", enc_record);
 
         self.write_sequence = self.write_sequence.overflowing_add(1).0;
         return (enc_record, padding);
