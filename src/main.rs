@@ -3,6 +3,7 @@ extern crate nom;
 extern crate bytes;
 extern crate tokio;
 extern crate tokio_dns;
+#[macro_use]
 extern crate futures;
 extern crate httparse;
 extern crate rand;

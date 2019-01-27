@@ -5,25 +5,34 @@ use std::cmp;
 use std::io;
 use std::io::{Read, Write, Error, ErrorKind};
 use std::mem;
-use std::net::TcpStream;
 use std::sync::Arc;
 use bytes::BytesMut;
 use rand::prelude::*;
 use openssl::pkey::{PKey, Private};
 use openssl::rsa::Padding;
 use openssl::hash::MessageDigest;
+use tokio::prelude::*;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 
-pub struct Stream {
+pub struct Stream<S> {
     read_buf: BytesMut,
     read_buf_decrypted: BytesMut,
     write_buf: BytesMut,
     write_buf_encrypted: BytesMut,
-    stream: TcpStream,
+    stream: S,
     cipher_data: CipherData
 }
 
-impl Read for Stream {
+impl <S: AsyncRead + AsyncWrite> AsyncRead for Stream<S> { }
+impl <S: AsyncRead + AsyncWrite> AsyncWrite for Stream<S> {
+    fn shutdown(&mut self) -> tokio::io::Result<Async<()>> {
+        try_ready!(self.poll_flush());
+        return self.stream.shutdown();
+    }
+}
+
+impl <S: Read + Write> Read for Stream<S> {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		assert!(!buf.is_empty());
 
@@ -62,7 +71,7 @@ impl Read for Stream {
 	}
 }
 
-impl Write for Stream {
+impl <S: Read + Write> Write for Stream<S> {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
 		self.write_buf.extend_from_slice(buf);
 		return Ok(buf.len());
@@ -100,17 +109,17 @@ enum HandshakeState {
 	Invalid
 }
 
-pub struct Handshake {
+pub struct Handshake<S> {
     state: HandshakeState,
     connection_id: [u8; 16],
     config: Arc<Config>,
     read_buf: BytesMut,
     write_buf: BytesMut,
-    stream: Option<TcpStream>
+    stream: Option<S>
 }
 
-impl Handshake {
-    pub fn new(stream: TcpStream, config: Arc<Config>) -> Handshake {
+impl <S: Read + Write> Handshake<S> {
+    pub fn new(stream: S, config: Arc<Config>) -> Handshake<S> {
         let mut connection_id = [0u8; 16];
         thread_rng().fill_bytes(&mut connection_id);
 
@@ -254,7 +263,7 @@ impl Handshake {
 
     }
 
-    fn into_stream(&mut self) -> Stream {
+    fn into_stream(&mut self) -> Stream<S> {
         match mem::replace(&mut self.state, HandshakeState::Invalid) {
 			HandshakeState::WaitingForFlush(cipher_data) => Stream {
                 read_buf: self.read_buf.take(),
@@ -312,7 +321,7 @@ impl Handshake {
 		Ok(())
 	}
 
-	pub fn handshake(&mut self) -> io::Result<Stream> {
+	pub fn handshake(&mut self) -> io::Result<Stream<S>> {
         loop {
 			self.write_pending_data()?;
 			let stream = self.stream.as_mut().unwrap();
