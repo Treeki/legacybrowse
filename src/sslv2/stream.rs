@@ -18,10 +18,34 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub struct Stream<S> {
     read_buf: BytesMut,
     read_buf_decrypted: BytesMut,
-    write_buf: BytesMut,
     write_buf_encrypted: BytesMut,
     stream: S,
     cipher_data: CipherData
+}
+
+impl <S: Write> Stream<S> {
+    pub fn has_pending_ciphertext(&self) -> bool {
+        !self.write_buf_encrypted.is_empty()
+    }
+
+    pub fn write_pending_ciphertext(&mut self) -> io::Result<()> {
+		while !self.write_buf_encrypted.is_empty() {
+			let written = self.stream.write(&self.write_buf_encrypted)?;
+            println!("written ciphertext {}", written);
+			self.write_buf_encrypted.advance(written);
+		}
+        Ok(())
+    }
+}
+
+impl <S: Write + AsyncWrite> Stream<S> {
+    pub fn poll_write_pending_ciphertext(&mut self) -> tokio::io::Result<Async<()>> {
+        match self.write_pending_ciphertext() {
+            Ok(()) => Ok(().into()),
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(Async::NotReady),
+            Err(e) => Err(e)
+        }
+    }
 }
 
 impl <S: AsyncRead + AsyncWrite> AsyncRead for Stream<S> { }
@@ -73,28 +97,20 @@ impl <S: Read + Write> Read for Stream<S> {
 
 impl <S: Read + Write> Write for Stream<S> {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		self.write_buf.extend_from_slice(buf);
+        // encrypt this data in chunks
+        // 0x3000 is a reasonable baseline, I think
+        for chunk in buf.chunks(0x3000) {
+            println!("encrypting chunk");
+            let (record_enc, padding) = self.cipher_data.encrypt_and_hash(chunk);
+            self.write_buf_encrypted.reserve(record_enc.len() + 3);
+			let record = SSLv2PackedRecord { data: &record_enc, padding };
+			record.write(&mut self.write_buf_encrypted);
+        }
 		return Ok(buf.len());
 	}
 
 	fn flush(&mut self) -> io::Result<()> {
-		// empty out our own buffers first
-		while !self.write_buf.is_empty() {
-			let record_size = cmp::min(0x3FFF, self.write_buf.len());
-			let record_dec = self.write_buf.split_to(record_size);
-			let (record_enc, padding) = self.cipher_data.encrypt_and_hash(&record_dec);
-
-			let record = SSLv2PackedRecord { data: &record_enc, padding };
-			self.write_buf_encrypted.reserve(record_enc.len() + 3);
-			record.write(&mut self.write_buf_encrypted);
-		}
-
-		// now write as much as possible
-		while !self.write_buf_encrypted.is_empty() {
-			let written = self.stream.write(&self.write_buf_encrypted)?;
-			self.write_buf_encrypted.advance(written);
-		}
-
+        self.write_pending_ciphertext()?;
 		self.stream.flush()?;
 		Ok(())
 	}
@@ -267,9 +283,8 @@ impl <S: Read + Write> Handshake<S> {
         match mem::replace(&mut self.state, HandshakeState::Invalid) {
 			HandshakeState::WaitingForFlush(cipher_data) => Stream {
                 read_buf: self.read_buf.take(),
-                write_buf: self.write_buf.take(),
 				read_buf_decrypted: BytesMut::new(),
-				write_buf_encrypted: BytesMut::new(),
+				write_buf_encrypted: self.write_buf.take(),
                 stream: self.stream.take().unwrap(),
                 cipher_data
             },

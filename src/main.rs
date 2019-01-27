@@ -11,8 +11,10 @@ extern crate openssl;
 
 pub mod sslv2;
 
+use std::mem;
 use std::sync::Arc;
 use tokio::io;
+use tokio::io::{Error, ErrorKind};
 use tokio::net::{TcpStream, TcpListener};
 use tokio::prelude::*;
 use futures::{Future, Async, Poll};
@@ -25,9 +27,158 @@ extern "C" {
 }
 
 
+struct HandshakeFuture<S> {
+    inner: sslv2::Handshake<S>
+}
+
+impl <S: Read + Write> HandshakeFuture<S> {
+    pub fn new(stream: S, config: Arc<sslv2::Config>) -> HandshakeFuture<S> {
+        HandshakeFuture { inner: sslv2::Handshake::new(stream, config) }
+    }
+}
+
+impl <S: Read + Write> Future for HandshakeFuture<S> {
+    type Item = sslv2::Stream<S>;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<sslv2::Stream<S>, Error> {
+        match self.inner.handshake() {
+            Ok(stream) => Ok(Async::Ready(stream)),
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(Async::NotReady),
+            Err(e) => Err(e)
+        }
+    }
+}
+
+
+enum TunnelFuture {
+    Handshake(HandshakeFuture<TcpStream>, TcpStream),
+    DataExchange {
+        client: sslv2::Stream<TcpStream>,
+        client_write_buf: BytesMut,
+        server: TcpStream,
+        server_write_buf: BytesMut
+    },
+    FlushToClient(sslv2::Stream<TcpStream>),
+    FlushToServer(TcpStream, BytesMut),
+    Invalid
+}
+
+impl TunnelFuture {
+    fn new(client: TcpStream, server: TcpStream, config: Arc<sslv2::Config>) -> TunnelFuture {
+        TunnelFuture::Handshake(HandshakeFuture::new(client, config), server)
+    }
+}
+
+impl Future for TunnelFuture {
+    type Item = ();
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<(), Error> {
+        use self::TunnelFuture::*;
+
+        loop {
+            match self {
+                Handshake(hs, _) => {
+                    let client = try_ready!(hs.poll());
+                    println!("handshake complete");
+
+                    match mem::replace(self, Invalid) {
+                        Handshake(_, server) => {
+                            *self = DataExchange {
+                                client, server,
+                                client_write_buf: BytesMut::new(),
+                                server_write_buf: BytesMut::new()
+                            };
+                        },
+                        _ => panic!()
+                    }
+                },
+                DataExchange { ref mut client, ref mut client_write_buf, ref mut server, ref mut server_write_buf } => {
+                    // do some exchanging
+                    server_write_buf.reserve(4096);
+                    client_write_buf.reserve(4096);
+                    let client_rd = client.read_buf(server_write_buf);
+                    let server_rd = server.read_buf(client_write_buf);
+                    if let Ok(Async::Ready(n)) = client_rd {
+                        if n > 0 {
+                            println!("read {} from client", n);
+                        }
+                    }
+                    if let Ok(Async::Ready(n)) = server_rd {
+                        if n > 0 {
+                            println!("read {} from server", n);
+                        }
+                    }
+
+                    let client_wr = client.poll_write(client_write_buf);
+                    if let Ok(Async::Ready(n)) = client_wr {
+                        client_write_buf.advance(n);
+                    }
+                    let server_wr = server.poll_write(server_write_buf);
+                    if let Ok(Async::Ready(n)) = server_wr {
+                        server_write_buf.advance(n);
+                    }
+
+                    let client_wp = client.poll_write_pending_ciphertext();
+
+                    match (client_rd, server_rd, client_wr, server_wr, client_wp) {
+                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady)) |
+                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::Ready(0)), Ok(Async::NotReady), Ok(Async::NotReady)) |
+                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::Ready(0)), Ok(Async::NotReady)) |
+                        (Ok(Async::NotReady), Ok(Async::NotReady), Ok(Async::Ready(0)), Ok(Async::Ready(0)), Ok(Async::NotReady)) => {
+                            // nothing has been read or written
+                            return Ok(Async::NotReady);
+                        },
+                        (Ok(Async::Ready(0)), _, _, _, _) | (Err(_), _, _, _, _) | (_, _, Err(_), _, _) | (_, _, _, _, Err(_)) => {
+                            // client EOF or error
+                            println!("client terminated");
+
+                            match mem::replace(self, Invalid) {
+                                DataExchange { server, server_write_buf, .. } => {
+                                    *self = FlushToServer(server, server_write_buf);
+                                },
+                                _ => panic!()
+                            }
+                        },
+                        (_, Ok(Async::Ready(0)), _, _, _) | (_, Err(_), _, _, _) | (_, _, _, Err(_), _) => {
+                            // server EOF or error
+                            println!("server terminated");
+
+                            match mem::replace(self, Invalid) {
+                                DataExchange { client, .. } => {
+                                    *self = FlushToClient(client);
+                                },
+                                _ => panic!()
+                            }
+                        },
+                        _ => ()
+                    }
+                },
+                FlushToClient(ref mut client) => {
+                    println!("flushing to client");
+                    return client.shutdown();
+                },
+                FlushToServer(ref mut server, ref mut server_write_buf) => {
+                    println!("flushing to server");
+                    if !server_write_buf.is_empty() {
+                        let written = try_ready!(server.poll_write(server_write_buf));
+                        server_write_buf.advance(written);
+                    } else {
+                        return server.shutdown();
+                    }
+                },
+                Invalid => panic!()
+            }
+        }
+    }
+}
+
+
 enum ConnState {
-    WaitingForRequest,
-    ConnectingToHost(tokio_dns::IoFuture<TcpStream>),
+    WaitingForRequest(BytesMut),
+    ConnectingToHost(tokio_dns::IoFuture<TcpStream>, bool),
+    Handshake,
     ConnectProxy,
     WriteAndShutdown
 }
@@ -35,20 +186,6 @@ enum ConnState {
 struct Socket {
     stream: Option<TcpStream>,
     write_buf: BytesMut
-}
-
-enum ReadResult {
-    Received(usize),
-    Closed,
-    Err(io::Error),
-    NotReady
-}
-
-enum WriteResult {
-    Sent(usize),
-    Closed,
-    Err(io::Error),
-    NotReady
 }
 
 impl Socket {
@@ -60,72 +197,56 @@ impl Socket {
         return self.stream.is_some();
     }
 
-    fn read_into(&mut self, buf: &mut BytesMut) -> ReadResult {
+    fn read_into(&mut self, buf: &mut BytesMut) -> Poll<usize, Error> {
         match &mut self.stream {
-            None         => return ReadResult::Closed,
-            Some(stream) => {
-                buf.reserve(1024);
-                match stream.read_buf(buf) {
-                    Err(err)               => return ReadResult::Err(err),
-                    Ok(Async::NotReady)    => return ReadResult::NotReady,
-                    Ok(Async::Ready(size)) => {
-                        if size == 0 {
-                            return ReadResult::Closed;
-                        } else {
-                            return ReadResult::Received(size);
-                        }
-                    }
-                }
+            None         => Err(Error::from(ErrorKind::ConnectionAborted)),
+            Some(stream) => match stream.poll_read(buf) {
+                Ok(Async::Ready(0)) => Err(Error::from(ErrorKind::ConnectionAborted)),
+                other_stuff         => other_stuff
             }
         }
     }
 
-    fn write(&mut self) -> WriteResult {
+    fn write(&mut self) -> Poll<usize, Error> {
         match &mut self.stream {
-            None         => return WriteResult::Closed,
-            Some(stream) => {
-                match stream.poll_write(&self.write_buf) {
-                    Err(err)               => return WriteResult::Err(err),
-                    Ok(Async::NotReady)    => return WriteResult::NotReady,
-                    Ok(Async::Ready(size)) => {
-                        self.write_buf.advance(size);
-                        return WriteResult::Sent(size);
-                    }
-                }
+            None         => Err(Error::from(ErrorKind::ConnectionAborted)),
+            Some(stream) => match stream.poll_write(&self.write_buf) {
+                Ok(Async::Ready(size)) => {
+                    self.write_buf.advance(size);
+                    Ok(Async::Ready(size))
+                },
+                other_stuff => other_stuff
             }
         }
     }
 
-    fn write_and_shutdown(&mut self) -> WriteResult {
+    fn write_and_shutdown(&mut self) -> Poll<(), Error> {
         match &mut self.stream {
-            None         => return WriteResult::Closed,
+            None         => Ok(Async::Ready(())),
             Some(stream) => {
                 if self.write_buf.is_empty() {
                     // shutdown stage reached
                     match stream.shutdown() {
-                        Ok(Async::NotReady)  => return WriteResult::NotReady,
+                        Ok(Async::NotReady)  => Ok(Async::NotReady),
                         Ok(Async::Ready(())) => {
                             self.stream = None;
-                            return WriteResult::Closed;
+                            Ok(Async::Ready(()))
                         },
                         Err(err)             => {
                             // we can't shut it down, so best we can do is drop it
                             self.stream = None;
-                            return WriteResult::Err(err);
+                            Ok(Async::Ready(()))
                         }
                     }
                 } else {
                     // try some writing
-                    match stream.poll_write(&self.write_buf) {
-                        Ok(Async::NotReady)    => return WriteResult::NotReady,
-                        Ok(Async::Ready(size)) => {
-                            self.write_buf.advance(size);
-                            return WriteResult::Sent(size);
-                        },
-                        Err(_)                 => {
-                            // writing failed, so give up on the buffer and try shutting down
+                    match self.write() {
+                        Ok(Async::NotReady) => Ok(Async::NotReady),
+                        Ok(Async::Ready(n)) => self.write_and_shutdown(),
+                        Err(_)              => {
+                            // just give up on writing this
                             self.write_buf.clear();
-                            return self.write_and_shutdown();
+                            self.write_and_shutdown()
                         }
                     }
                 }
@@ -136,8 +257,6 @@ impl Socket {
 
 struct ProxyFuture {
     state: ConnState,
-    initial_buffer: BytesMut,
-    is_tunnel: bool,
     client: Socket,
     server: Socket
 }
@@ -145,9 +264,7 @@ struct ProxyFuture {
 impl ProxyFuture {
     fn new(socket: TcpStream) -> ProxyFuture {
         ProxyFuture {
-            state: ConnState::WaitingForRequest,
-            initial_buffer: BytesMut::new(),
-            is_tunnel: false,
+            state: ConnState::WaitingForRequest(BytesMut::new()),
             client: Socket::new(Some(socket)),
             server: Socket::new(None),
         }
@@ -158,45 +275,40 @@ impl ProxyFuture {
         self.state = ConnState::WriteAndShutdown;
     }
 
-    fn shutdown(&mut self, description: &str) {
-        println!("closing due to {}", description);
-        self.state = ConnState::WriteAndShutdown;
-    }
-
     fn shutdown_err(&mut self, description: &str, err: io::Error) {
         println!("closing due to {}: {}", description, err);
         self.state = ConnState::WriteAndShutdown;
     }
 
-    fn try_handle_client_request(&mut self) {
-        let mut headers = [httparse::EMPTY_HEADER; 16];
-        let mut request = httparse::Request::new(&mut headers);
-        let request_buffer = self.initial_buffer.take();
-        let parse_result = request.parse(&request_buffer);
+    // fn try_handle_client_request(&mut self) {
+    //     let mut headers = [httparse::EMPTY_HEADER; 16];
+    //     let mut request = httparse::Request::new(&mut headers);
+    //     let request_buffer = self.initial_buffer.take();
+    //     let parse_result = request.parse(&request_buffer);
 
-        match parse_result {
-            Ok(status) => {
-                if status.is_complete() {
-                    // we've presumably got everything
-                    if let Some("CONNECT") = request.method {
-                        self.initiate_tunnel(&request);
-                    } else {
-                        self.initiate_http_request(&request);
-                    }
-                } else {
-                    // can't do anything yet -- wait for more data
-                    // we'll need to put back the buffer we took out earlier
-                    self.initial_buffer = request_buffer;
-                    return;
-                }
-            },
-            Err(err) => {
-                println!("request parse error: {}", err);
-                self.close_with_400();
-                return;
-            }
-        }
-    }
+    //     match parse_result {
+    //         Ok(status) => {
+    //             if status.is_complete() {
+    //                 // we've presumably got everything
+    //                 if let Some("CONNECT") = request.method {
+    //                     self.initiate_tunnel(&request);
+    //                 } else {
+    //                     self.initiate_http_request(&request);
+    //                 }
+    //             } else {
+    //                 // can't do anything yet -- wait for more data
+    //                 // we'll need to put back the buffer we took out earlier
+    //                 self.initial_buffer = request_buffer;
+    //                 return;
+    //             }
+    //         },
+    //         Err(err) => {
+    //             println!("request parse error: {}", err);
+    //             self.close_with_400();
+    //             return;
+    //         }
+    //     }
+    // }
 
     fn initiate_http_request(&mut self, request: &httparse::Request) {
         if request.method.is_none() || request.path.is_none() {
@@ -235,12 +347,11 @@ impl ProxyFuture {
 
             if !host.contains(':') {
                 let future = tokio_dns::TcpStream::connect((host, 80));
-                self.state = ConnState::ConnectingToHost(future);
+                self.state = ConnState::ConnectingToHost(future, false);
             } else {
                 let future = tokio_dns::TcpStream::connect(host);
-                self.state = ConnState::ConnectingToHost(future);
+                self.state = ConnState::ConnectingToHost(future, false);
             }
-            self.is_tunnel = false;
         }
     }
 
@@ -250,8 +361,7 @@ impl ProxyFuture {
             None => self.close_with_400(),
             Some(path) => {
                 let future = tokio_dns::TcpStream::connect(path);
-                self.state = ConnState::ConnectingToHost(future);
-                self.is_tunnel = true;
+                self.state = ConnState::ConnectingToHost(future, true);
             }
         }
     }
@@ -264,25 +374,42 @@ impl Future for ProxyFuture {
     fn poll(&mut self) -> Poll<(), io::Error> {
         loop {
             match &mut self.state {
-                ConnState::WaitingForRequest => {
-                    // check what the first stuff we have is
-                    match self.client.read_into(&mut self.initial_buffer) {
-                        ReadResult::NotReady    => return Ok(Async::NotReady),
-                        ReadResult::Err(err)    => self.shutdown_err("initial read err", err),
-                        ReadResult::Closed      => self.shutdown("initial close"),
-                        ReadResult::Received(_) => self.try_handle_client_request()
+                ConnState::Handshake => {
+                    // todo
+                },
+                ConnState::WaitingForRequest(ref mut buffer) => {
+                    buffer.reserve(4096);
+                    try_ready!(self.client.read_into(buffer));
+
+                    // parse a request, if we can
+                    let buffer_ = buffer.take();
+                    let mut headers = [httparse::EMPTY_HEADER; 16];
+                    let mut request = httparse::Request::new(&mut headers);
+                    match request.parse(&buffer_) {
+                        Ok(status) => {
+                            if status.is_complete() {
+                                // we have a full request; go forth and continue
+                                self.initiate_http_request(&request);
+                            } else {
+                                // return the buffer to whence it came
+                                // we require more data
+                                *buffer = buffer_;
+                            }
+                        },
+                        Err(e) => self.close_with_400()
                     }
                 },
-                ConnState::ConnectingToHost(future) => {
+                ConnState::ConnectingToHost(future, is_tunnel) => {
                     match future.poll() {
                         Ok(Async::NotReady) => return Ok(Async::NotReady),
                         Ok(Async::Ready(stream)) => {
                             println!("connected to host");
                             self.server.stream = Some(stream);
-                            self.state = ConnState::ConnectProxy;
-                            if self.is_tunnel {
-                                self.client.write_buf.put("HTTP/1.0 200 OK\r\n\r\n");
-                            }
+                            // if is_tunnel {
+                            //     self.client.write_buf.put("HTTP/1.0 200 OK\r\n\r\n");
+                            // } else {
+                                self.state = ConnState::ConnectProxy;
+                            // }
                         },
                         Err(err) => {
                             println!("connection failed: {}", err);
@@ -293,71 +420,46 @@ impl Future for ProxyFuture {
                 },
                 ConnState::ConnectProxy => {
                     let mut not_ready = false;
-                    let mut received_stuff = false; // in case we need to loop over again
+                    let mut done_stuff = false; // in case we need to loop over again
 
                     match self.client.read_into(&mut self.server.write_buf) {
-                        ReadResult::Received(n) => { println!("client:{}", n); received_stuff = true; },
-                        ReadResult::NotReady    => not_ready = true,
-                        ReadResult::Err(err)    => self.shutdown_err("client read error", err),
-                        ReadResult::Closed      => self.shutdown("client closed")
+                        Ok(Async::Ready(n)) => { println!("<client:{}", n); done_stuff = true; },
+                        Ok(Async::NotReady) => not_ready = true,
+                        Err(err)            => self.shutdown_err("client read error", err)
                     }
-
                     match self.server.read_into(&mut self.client.write_buf) {
-                        ReadResult::Received(n) => { println!("server:{}", n); received_stuff = true; },
-                        ReadResult::NotReady    => not_ready = true,
-                        ReadResult::Err(err)    => self.shutdown_err("server read error", err),
-                        ReadResult::Closed      => self.shutdown("server closed")
+                        Ok(Async::Ready(n)) => { println!("<server:{}", n); done_stuff = true; },
+                        Ok(Async::NotReady) => not_ready = true,
+                        Err(err)            => self.shutdown_err("server read error", err)
                     }
 
                     // TODO set received_stuff if written too??
                     match self.client.write() {
-                        WriteResult::NotReady => not_ready = true,
-                        WriteResult::Err(err) => self.shutdown_err("client write error", err),
-                        _                     => ()
+                        Ok(Async::Ready(n)) => { println!(">client:{}", n); done_stuff = true; },
+                        Ok(Async::NotReady) => not_ready = true,
+                        Err(err)            => self.shutdown_err("client write error", err)
                     }
 
                     match self.server.write() {
-                        WriteResult::NotReady => not_ready = true,
-                        WriteResult::Err(err) => self.shutdown_err("server write error", err),
-                        _                     => ()
+                        Ok(Async::Ready(n)) => { println!(">server:{}", n); done_stuff = true; },
+                        Ok(Async::NotReady) => not_ready = true,
+                        Err(err)            => self.shutdown_err("server write error", err)
                     }
 
-                    if not_ready && !received_stuff {
+                    if not_ready && !done_stuff {
                         return Ok(Async::NotReady);
                     }
                 },
                 ConnState::WriteAndShutdown => {
-                    let mut not_ready = false;
-                    let mut written_stuff = false;
-
-                    match self.client.write_and_shutdown() {
-                        WriteResult::Sent(_)  => written_stuff = true,
-                        WriteResult::NotReady => not_ready = true,
-                        WriteResult::Err(err) => println!("client shutdown error: {}", err),
-                        _                     => ()
-                    }
-
-                    match self.server.write_and_shutdown() {
-                        WriteResult::Sent(_)  => written_stuff = true,
-                        WriteResult::NotReady => not_ready = true,
-                        WriteResult::Err(err) => println!("server shutdown error: {}", err),
-                        _                     => ()
-                    }
-
-                    if not_ready && !written_stuff {
-                        return Ok(Async::NotReady);
-                    }
-                    if !self.client.is_open() && !self.server.is_open() {
-                        println!("all done");
-                        return Ok(Async::Ready(()));
-                    }
+                    try_ready!(self.client.write_and_shutdown());
+                    try_ready!(self.server.write_and_shutdown());
+                    return Ok(Async::Ready(()));
                 }
             }
 
         }
     }
 }
-
 
 
 
@@ -385,11 +487,18 @@ fn main() {
 
     let server = listener.incoming().for_each(move |socket| {
         println!("got socket");
-        let handler = ProxyFuture::new(socket)
-        .map_err(|err| {
-            println!("handler error: {}", err);
-        });
-        tokio::spawn(handler);
+        let root_ssl_config = root_ssl_config.clone();
+        let fut = TcpStream::connect(&"81.4.111.14:80".parse().unwrap())
+        .and_then(move |server_stream| {
+            println!("connected!!");
+            TunnelFuture::new(socket, server_stream, root_ssl_config)
+        }).map_err(|e| { println!("connect error: {}", e); });
+        tokio::spawn(fut);
+        // let handler = TunnelFuture::new(socket, server_stream, root_ssl_config.clone())
+        // .map_err(|err| {
+        //     println!("handler error: {}", err);
+        // });
+        // tokio::spawn(server_future);
         Ok(())
     })
     .map_err(|err| {
